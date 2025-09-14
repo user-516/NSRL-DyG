@@ -1,0 +1,618 @@
+import torch
+import numpy as np
+from torch import nn
+import torch.nn.functional as F
+from .memory import Memory
+from torch.distributions import Bernoulli
+from torch.autograd import Variable
+
+
+from torch.nn import MSELoss
+class BlockTransformer(nn.Module):
+    def __init__(
+        self,
+        embedder: nn.Module,
+        block_decoder: nn.Module,
+        token_decoder: nn.Module,
+        use_token_loss=False,
+        use_block_loss=False,
+        block_length=4
+    ):
+        super().__init__()
+        self.embedder = embedder
+        self.block_decoder = block_decoder
+        self.token_decoder = token_decoder
+        self.block_length = block_length
+        self.n_embedding_tokens = embedder.n_embedding_tokens
+        
+        # Loss flags
+        self.use_token_loss = use_token_loss
+        self.use_block_loss = use_block_loss
+        
+        # For compatibility
+        self.config = token_decoder.config
+
+    def forward(self, input_ids, attention_mask, block_attention_mask, labels=None):
+        batch_size, n_blocks, block_len = input_ids.shape
+        
+        # 1. Embedding Layer
+        input_embeds = self.embedder(
+            input_ids.view(-1, block_len),
+            attention_mask.view(-1, block_len)
+        )
+        
+        # 2. Block Decoding
+        input_embeds = input_embeds.view(batch_size, -1, input_embeds.shape[-1])
+        block_output = self.block_decoder(
+            inputs_embeds=input_embeds, 
+            block_attention_mask=block_attention_mask,
+            return_dict=True
+        )
+        
+        loss = None
+        # Block loss calculation
+        if self.use_block_loss and labels is not None:
+            loss = block_output.loss
+            
+        # 3. Token Decoding
+        # Shift blocks for token prediction
+        shifted_input_ids = input_ids[:, 1:].reshape(-1, block_len)
+        shifted_mask = attention_mask[:, 1:].reshape(-1, block_len)
+        
+        # Get block embeddings (excluding last block)
+        block_embeddings = block_output.hidden_states[:, :-self.n_embedding_tokens]
+        block_embeddings = block_embeddings.reshape(-1, self.n_embedding_tokens, block_embeddings.shape[-1])
+        
+        # Token decoder forward pass
+        token_output = self.token_decoder(
+            input_ids=shifted_input_ids,
+            attention_mask=shifted_mask,
+            block_embeddings=block_embeddings,
+            labels=labels[:, 1:].reshape(-1, block_len) if self.use_token_loss else None
+        )
+        
+        # Combine losses
+        if self.use_token_loss:
+            loss = token_output.loss if loss is None else loss + token_output.loss
+            
+        return {
+            "logits": token_output.logits,
+            "loss": loss
+        }
+
+    def generate(self, input_ids, attention_mask=None, max_length=100):
+        # Convert to block format if needed
+        if input_ids.dim() == 2:
+            batch_size, seq_len = input_ids.shape
+            pad_len = (self.block_length - seq_len % self.block_length) % self.block_length
+            input_ids = torch.nn.functional.pad(input_ids, (pad_len, 0), value=self.config.pad_token_id)
+            input_ids = input_ids.view(batch_size, -1, self.block_length)
+        
+        # Initial embedding
+        block_embeddings = self.embedder(input_ids.view(-1, self.block_length))
+        block_embeddings = block_embeddings.view(input_ids.shape[0], -1, block_embeddings.shape[-1])
+        
+        # Generation loop
+        while input_ids.shape[1] * input_ids.shape[2] < max_length:
+            # Block decoding
+            block_output = self.block_decoder(inputs_embeds=block_embeddings)
+            
+            # Predict next block
+            next_block = block_output.hidden_states[:, -1:]
+            token_logits = self.token_decoder.generate(next_block)
+            
+            # Get next token from logits
+            next_token = token_logits.argmax(dim=-1)[..., -1:]
+            
+            # Update block embeddings
+            new_embed = self.embedder(next_token)
+            block_embeddings = torch.cat([block_embeddings, new_embed], dim=1)
+            
+            # Update input_ids
+            input_ids = torch.cat([input_ids, next_token.unsqueeze(1)], dim=1)
+            
+        return input_ids
+
+class MultiHeadAttention(nn.Module):
+	def __init__(self, input_dim, num_heads, hidden_dim,device):
+		super(MultiHeadAttention, self).__init__()
+		assert hidden_dim % num_heads == 0, "Hidden dimension must be divisible by the number of heads."
+		self.hidden_dim = hidden_dim
+		self.num_heads = num_heads
+		self.head_dim = hidden_dim // num_heads
+		self.device = device
+		# 为每个头创建一个线性层
+		self.W_p = nn.ModuleList([nn.Linear(input_dim, self.head_dim) for _ in range(num_heads)]).to(self.device)
+
+		# 可学习的缩放因子
+		self.sigma2 = nn.Parameter(torch.ones(1)).to(self.device)
+
+		# 激活函数ReLU
+		self.phi = nn.ReLU().to(self.device)
+
+		# 线性层用于输出变换，调整以适应最终的输出维度
+		self.W_k = nn.Linear(hidden_dim, 64).to(self.device)  # 输出维度调整为64以匹配需求
+
+	def forward(self, x, time_diffs, context_vectors):
+		# 将x视为单个时间点的特征，我们扩展它以模拟序列
+		x_expanded = x.unsqueeze(1).expand(-1, 20, -1).to(self.device) # 扩展到n_update_degree个时间步以匹配context_vectors
+		batch_size, seq_length, _ = x_expanded.shape
+
+		# 确保时间差信息维度与序列长度匹配
+		assert time_diffs.shape == (batch_size, seq_length), "Time diffs shape does not match the sequence length."
+
+		# 重复context_vectors以匹配seq_length
+		repeat_times = seq_length // context_vectors.size(1) + (1 if seq_length % context_vectors.size(1) else 0)
+		repeated_context = context_vectors.repeat(1, repeat_times, 1)[:, :seq_length, :]  # 确保最终长度不超过seq_length
+
+		# 初始化用于存储最终输出的列表
+		all_head_outputs = []
+
+		for k in range(self.num_heads):
+			# 应用线性变换到扩展后的输入特征
+			projected_x = self.W_p[k](x_expanded).to(self.device)
+
+			# 将时间差信息与输入特征结合
+			time_diffs_broadcast = time_diffs.unsqueeze(-1).to(self.device)
+			combined = time_diffs_broadcast * projected_x
+
+			# 应用非线性变换
+			transformed = self.phi(combined).float()
+
+			# 计算注意力分数
+			attn_scores = torch.einsum('bik,bjk->bij', transformed,
+									   repeated_context[:, :, :self.head_dim]) * self.sigma2
+
+			# 归一化得到注意力权重
+			attn_weights = F.softmax(attn_scores, dim=2)
+
+			# 应用注意力权重到输入特征
+			head_output = torch.einsum('bij,bjk->bik', attn_weights, projected_x)
+
+			# 存储每个头的输出
+			all_head_outputs.append(head_output.unsqueeze(-2))
+
+		# 合并所有头的输出
+		combined_output = torch.cat(all_head_outputs, dim=-2).reshape(batch_size, seq_length, -1)
+
+		# 应用最后的线性变换以获得所需的输出维度
+		output = self.W_k(combined_output)
+		return output
+
+
+
+class CustomGRU(nn.Module):
+    """
+    Custom implementation of a Gated Recurrent Unit (GRU) cell.
+
+    Parameters:
+    - input_size: int, the number of expected features in the input `x`
+    - hidden_size: int, the number of features in the hidden state `h`
+    """
+
+    def __init__(self, input_size, hidden_size):
+        super(CustomGRU, self).__init__()
+        # Define the linear transformations for the gates
+        self.input_proj = nn.Linear(input_size, hidden_size, bias=True)
+        self.hidden_size = hidden_size
+        self.update_gate_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.reset_gate_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.candidate_hidden_proj = nn.Linear(hidden_size + input_size, hidden_size, bias=True)
+
+    def forward(self, x, h_prev):
+        """
+        Forward pass of the CustomGRU cell.
+
+        Parameters:
+        - x: Tensor, input tensor of shape (batch_size, input_size)
+        - h_prev: Tensor, previous hidden state of shape (batch_size, hidden_size)
+
+        Returns:
+        - h_t: Tensor, current hidden state
+        """
+
+        # Project input to hidden size
+        x_proj = self.input_proj(x)
+
+        # Compute update and reset gates
+        z_t = torch.sigmoid(self.update_gate_proj(h_prev))
+        r_t = torch.sigmoid(self.reset_gate_proj(h_prev))
+
+        # Apply reset gate to the previous hidden state
+        h_prev_reset = r_t * h_prev
+
+        # Compute candidate hidden state
+        combined_input = torch.cat((h_prev_reset, x_proj), dim=1)
+        h_tilde = torch.tanh(self.candidate_hidden_proj(combined_input))
+
+        # Update current hidden state
+        h_t = (1 - z_t) * h_tilde + z_t * h_prev
+
+        return h_t
+	
+
+
+
+class ResidualMLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
+        super(ResidualMLP, self).__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.num_layers = num_layers
+        
+        # 创建多层全连接层
+        self.layers = nn.ModuleList(
+            nn.Linear((input_dim if i == 0 else hidden_dim), hidden_dim) for i in range(num_layers)
+        )
+        
+        # 最后的全连接层从隐藏层维度映射到输出维度
+        self.final_layer = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        # 保存输入用于残差连接
+        original_input = x
+        # 通过多层全连接层
+        for layer in self.layers:
+            x = F.relu(layer(original_input) + original_input if original_input is not x else layer(x))
+            original_input = x
+        # 最后的全连接层
+        x = self.final_layer(x)
+        return F.relu(x)
+
+
+
+# 时间编码
+class TimeEncode(nn.Module):
+    """
+    out = linear(time_scatter): 1-->time_dims
+    out = cos(out)
+    """
+    def __init__(self, input_dim, output_dim):
+        super(TimeEncode, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.w = nn.Linear(input_dim, output_dim)
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        # 创建一个对角线为1/10^n的矩阵，其中 n 为对角线索引
+        diag_values = 1 / 10 ** np.arange(self.output_dim, dtype=np.float32)
+        weight_matrix = np.diag(diag_values)
+        self.w.weight = nn.Parameter(torch.from_numpy(weight_matrix).reshape(self.input_dim, self.output_dim))
+        self.w.bias = nn.Parameter(torch.zeros(self.output_dim))
+        self.w.weight.requires_grad = False
+        self.w.bias.requires_grad = False
+    
+    @torch.no_grad()
+    def forward(self, t):
+        # 直接应用线性层和余弦函数
+        output = torch.cos(self.w(t))
+        return output
+
+
+
+class MultiScaleTemporalAttention(nn.Module):
+    def __init__(self, num_scales, embed_dim, output_dim):
+        super().__init__()
+        self.num_scales = num_scales
+        self.W_g = nn.ModuleList([nn.Linear(2 * embed_dim, output_dim) for _ in range(num_scales)]).to('cuda') # 修改线性层以拼接后的维度
+        self.decay_rates = nn.ParameterList([nn.Parameter(torch.randn(1)) for _ in range(num_scales)])
+        self.final_linear = nn.Linear(num_scales * output_dim * 2, output_dim * 20 * 2).to('cuda')  # 修改最终线性层输入维度
+        self.mlp = ResidualMLP(embed_dim * 2 , 128, output_dim,3).to('cuda')
+
+		
+    def forward(self, neighbors, center_emb, current_time, edge_times):
+        B, N, E = neighbors.shape  # E is the embed_dim
+        multi_scale_messages = []
+        # 实例化 TimeEncode 对象
+        time_encode = TimeEncode(20,20).to('cuda')
+        b = 1
+        for scale in range(self.num_scales):
+            time_diff = current_time - edge_times
+            # damp = torch.exp(-self.decay_rates[scale].clamp(min=1e-15).detach().cpu()* time_diff).to('cuda')  #(16,20)
+			# =exp⁡(-(Δt^2)/(2b^2 )),这里高斯带宽取b = 3
+            damp = torch.exp(-self.decay_rates[scale].clamp(min=1e-15).detach().cpu()* (time_diff**2)/(2*pow(b,2))).to('cuda')  #(16,20)
+            damp = damp.detach().cpu()
+            damp = time_encode(torch.tensor(np.float32(damp)).to('cuda'))
+            # Concatenate center_emb and neighbors
+            concat_input = torch.cat([center_emb, neighbors], dim=2) #（16，20，128）
+            
+            # Apply linear transformation
+            transformed = self.W_g[scale](concat_input)   # （16，20，32）
+            # transformed = self.mlp(concat_input)	
+             
+            # Calculate attention scores
+            att_scores = torch.sum(transformed, dim=2)  # Sum over the embedding dimension (16,20)
+            
+            # Apply dampening factor
+            att_scores = (att_scores * damp)  #(16,20)
+			
+            
+            # Normalize attention scores
+            att_weights = F.softmax(att_scores, dim=1) # (16,20)
+           
+            # Weighted sum of neighbors using attention weights
+            weighted_neighbors = neighbors * att_weights.unsqueeze(-1)   #(16,20,64)
+            agg_neighbors = torch.sum(weighted_neighbors, dim=1)  # Aggregate over neighbors (16,64)
+         
+            # Append the transformed and aggregated message for this scale
+            multi_scale_messages.append(agg_neighbors)
+        
+        # Concatenate messages from all scales
+        fused_message = torch.cat(multi_scale_messages, dim=1)   #(16,64*3)
+        final_output = self.final_linear(fused_message.float())
+        
+        
+        # Reshape to (B, 2 * N, output_dim) as we have double the number of elements after concatenation
+        # print(final_output.shape)
+        final_output = final_output.view(B, 40, 32)
+        return final_output
+
+
+
+class EmbeddingCombiner(nn.Module):
+    def __init__(self, input_size=64, hidden_size=64):
+        super(EmbeddingCombiner, self).__init__()
+        self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size)
+
+    def forward(self, prev_dst, current_dst):
+        """
+        :param prev_dst: 上一时刻的嵌入，维度为 [16, 64]
+        :param current_dst: 当前时刻的嵌入，维度为 [16, 64]
+        :return: 结合上一时刻和当前时刻的嵌入表示
+        """
+        # 将输入转换为适合 LSTM 的格式，即添加时间维度
+        prev_dst = prev_dst.unsqueeze(0)  
+        current_dst = current_dst.unsqueeze(0)  
+
+        # 初始化 LSTM 的隐藏状态和细胞状态为 0
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        h0 = torch.zeros(1, prev_dst.size(1), self.lstm.hidden_size).to(device)
+        c0 = torch.zeros(1, prev_dst.size(1), self.lstm.hidden_size).to(device)
+
+        # 通过 LSTM 得到输出
+        output, (hn, cn) = self.lstm(current_dst, (h0, c0))
+
+        # 取出最后一个时间步的输出作为结果
+        combined_embedding = output.squeeze(0)  
+
+        return combined_embedding
+    
+
+
+
+
+    
+
+class NSRLDyG(nn.Module):
+	def __init__(self, n_nodes, n_neighbors, n_update_neighbors,
+				 edge_dim, emb_dim, message_dim,
+				 neighbor_finder, edge_feat, tot_time, device='cpu'):
+		super(NSRLDyG, self).__init__()
+		torch.manual_seed(0)
+		# graph
+		self.damp_list = []
+		self.n_nodes = n_nodes
+		# Dimensions
+		self.feat_dim = 100
+		self.edge_dim = edge_dim
+		self.emb_dim = emb_dim
+		self.message_dim = message_dim
+		# memory
+		self.edge_feat = torch.tensor(edge_feat, dtype=torch.float).to(device)
+		self.memory = Memory(self.n_nodes, self.emb_dim, device)
+		# other
+		self.tot_time = tot_time
+		self.n_neighbors = n_neighbors
+		self.n_update_neighbors = n_update_neighbors
+		self.neighbor_finder = neighbor_finder
+		self.device = device
+		self.temperature = 5
+		self.eps = 1e-10
+		self.gamma = 1
+		# GAT
+		self.W_g = nn.Parameter(torch.zeros((self.emb_dim, self.message_dim // 2)).to(self.device))
+		self.a = nn.Parameter(torch.zeros(self.message_dim//2).to(self.device))
+		self.dropout = nn.Dropout(p=0.5)
+		nn.init.xavier_normal_(self.W_g)
+
+		self.W_e = nn.Parameter(torch.zeros((self.edge_dim, self.message_dim)).to(self.device))
+		nn.init.xavier_normal_(self.W_e)
+
+		self.W_uc = nn.Parameter(torch.zeros((self.emb_dim + 2 * self.message_dim, self.emb_dim)).to(self.device))
+		self.W_un = nn.Parameter(torch.zeros((self.emb_dim + self.message_dim, self.emb_dim)).to(self.device))
+		nn.init.xavier_normal_(self.W_uc)
+		nn.init.xavier_normal_(self.W_un)
+
+		self.W_p = nn.Parameter(torch.zeros((2 * self.message_dim, self.message_dim)).to(self.device))
+		nn.init.xavier_normal_(self.W_p)
+
+		self.W_1 = nn.Parameter(torch.zeros((self.emb_dim * 2, self.emb_dim)).to(self.device))
+		self.W_2 = nn.Parameter(torch.zeros((self.emb_dim, 1)).to(self.device))
+		nn.init.xavier_normal_(self.W_1)
+		nn.init.xavier_normal_(self.W_2)
+		self.beta = 0.1
+		# self.mlp1 = ResidualMLP1(32 , 64, 32,3).to('cuda')
+
+	
+	
+	
+	def forward(self, src_idxs, dst_idxs, neg_idxs, edge_idxs, timestamps):
+		# GRU模块
+		custom_gru = CustomGRU(input_size=32, hidden_size=32)
+		# 指定设备
+		device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+		# 将模型移动到指定的设备上
+		custom_gru = custom_gru.to(device)
+
+		MultiScaleTemporalAttention_model = MultiScaleTemporalAttention(3, self.emb_dim, self.emb_dim//2)
+		message = []
+		model_EmbeddingCombiner = EmbeddingCombiner().to('cuda')
+		for i, idxs in enumerate([src_idxs, dst_idxs]):
+
+			# 获取给定节点 idxs 在指定时间戳 timestamps 下的 n_neighbors 个最近邻节点及其对应的边创建时间 edge_times。
+			neighbors, _, edge_times = self.neighbor_finder.get_temporal_neighbor(idxs, timestamps, self.n_neighbors)
+			# 将输入的时间戳 timestamps 沿第1轴（列）复制 n_neighbors 次，使得每个中心节点对应其所有邻居节点的时间戳,current_time的形状为[len(timestamps),self.n_neighbors],此代码中为[16,20]
+			current_time = np.repeat(np.expand_dims(timestamps, axis=1), self.n_neighbors, axis=1)
+			#  计算当前时间 current_time 与邻居节点边创建时间 edge_times 之间的时间间隔，并将其除以总时间 self.tot_time 进行标准化。
+			interval = (current_time - edge_times) / self.tot_time
+			# # (16,20)
+			damp = 1 / (1 + self.gamma * interval)
+			neighbors = torch.from_numpy(neighbors).long().to(self.device)
+			bs = neighbors.shape[0]
+			# 从记忆模块 self.memory 中提取邻居节点的嵌入向量。(16,20,64)
+			neighbor_emb = self.memory.emb[neighbors.flatten()].view(bs, self.n_neighbors, self.emb_dim)
+
+			# (16,20,64)
+			# 重复 damp 以匹配 neighbor_emb 的维度，并转换为 float32 类型
+			damp = np.repeat(np.expand_dims(damp, axis=2), self.emb_dim, axis=2)
+			# damp = torch.tensor(damp, dtype=torch.float32).to(self.device)
+			# 邻居节点嵌入乘以时间衰减因子 对于公式（1）中分子的后半部分
+			# neighbor_emb = neighbor_emb * torch.from_numpy(np.float32(damp)).to(self.device)
+			#(16,20,64)
+			center_emb = torch.matmul(self.memory.emb[idxs], self.W_g).unsqueeze(dim=1).repeat(1, self.n_neighbors, 2)
+			
+			h = MultiScaleTemporalAttention_model(neighbor_emb, center_emb, current_time, edge_times)  #(16,40,32)
+			# h = self.mlp1(h)
+			center_emb_prev = torch.matmul(self.memory.emb[idxs], self.W_g).to(self.device)
+			h = custom_gru(h[:,i,:],center_emb_prev)
+			# (16,40,32)
+			h = h.unsqueeze(dim=1).repeat(1,40,1)
+			h = h + torch.matmul(self.memory.emb[idxs], self.W_g).unsqueeze(dim=1).repeat(1, self.n_neighbors // 5 , 1)
+			
+			# =========================================================================
+
+			message.append(h)
+		prev_src = self.memory.emb[src_idxs].to('cuda')
+		h = torch.cat((message[0], message[1]), dim=2).sum(dim=1).relu()
+		h_e = torch.matmul(self.edge_feat[edge_idxs], self.W_e).relu()
+		h = torch.cat((h, h_e), dim=1)
+
+		to_updated_src = torch.matmul(torch.cat((self.memory.emb[src_idxs], h), dim=1), self.W_uc).tanh().to('cuda')
+		to_updated_dst = torch.matmul(torch.cat((self.memory.emb[dst_idxs], h), dim=1), self.W_uc).tanh().to('cuda')
+		prev_dst = self.memory.emb[dst_idxs].to('cuda')
+            
+		self.memory.emb[src_idxs] = to_updated_src      
+		self.memory.emb[dst_idxs] = to_updated_dst  
+            
+		# self.memory.emb[src_idxs] = model_EmbeddingCombiner(prev_src,to_updated_src)
+		# self.memory.emb[dst_idxs] = model_EmbeddingCombiner(prev_dst,to_updated_dst)
+
+		# changed_emb_lt = []
+		model = MultiHeadAttention(input_dim=128, num_heads=16, hidden_dim=128,device='cuda')
+		# prop
+		for idxs in [src_idxs, dst_idxs]:
+			neighbors, _, edge_times = self.neighbor_finder.get_temporal_neighbor(idxs, timestamps,
+																				  self.n_update_neighbors)
+			current_time = np.repeat(np.expand_dims(timestamps, axis=1), self.n_update_neighbors, axis=1)
+			interval = (current_time - edge_times) / self.tot_time
+			decay_rates =  torch.linspace(0.1, 2.0, len(neighbors))
+			decayed_intervals = [torch.exp(-decay_rate * interval) for decay_rate in decay_rates]
+			neighbors = torch.from_numpy(neighbors).long().to(self.device)
+			bs = neighbors.shape[0]
+			neighbor_emb = self.memory.emb[neighbors.flatten()].view(bs, self.n_update_neighbors, self.emb_dim)
+			# for interval in decayed_intervals:
+			damp = 1 / (1 + self.gamma * interval)
+			# neighbor_emb [bs][n_update_neighbors][emb_dim]
+			damp = np.repeat(np.expand_dims(damp, axis=2), self.emb_dim, axis=2)
+			neighbor_emb = neighbor_emb * torch.from_numpy(np.float32(damp)).to(self.device)
+
+			# =====================================================================================
+			damp1 = 1 / (1 + self.gamma * interval)
+			damp1 = torch.tensor(damp1)
+			# (16,20,64)
+			changed_emb = model(h,damp1,neighbor_emb)
+			# =====================================================================================
+
+			x = torch.cat((neighbor_emb, changed_emb), dim=2)
+			x.detach_()
+			x = torch.matmul(x, self.W_1)
+			x = x.relu()
+			x = torch.matmul(x, self.W_2)
+			probs = x.sigmoid()
+			# (320,64)
+			changed_emb = torch.matmul(torch.cat((self.memory.emb[neighbors.flatten()],
+												changed_emb.flatten().view(-1, self.emb_dim)), dim=1), self.W_un).tanh()
+				# changed_emb_lt.append(changed_emb)
+			# changed_embs = [sum(x) for x in zip(*changed_emb_lt)]
+			# changed_emb = sum(changed_emb_lt) / len(changed_emb_lt)
+			policy_loss = 0
+			reward = 0
+			policy_map = probs.data.clone()
+			policy_map[policy_map < 0.5] = 0.0
+			policy_map[policy_map >= 0.5] = 1.0
+			policy_map = Variable(policy_map)
+			distr = Bernoulli(probs)
+			policy = distr.sample()
+			if not self.training:
+				mask = policy_map.repeat(1, 1, self.emb_dim).flatten().view(-1, self.emb_dim)
+				self.memory.emb[neighbors.flatten()] = mask * changed_emb + (1 - mask) * self.memory.emb[
+					neighbors.flatten()]
+			else:
+				policy_map = policy_map.repeat(1, 1, self.emb_dim).flatten().view(-1, self.emb_dim)
+				policy_sample = policy.repeat(1, 1, self.emb_dim).flatten().view(-1, self.emb_dim)
+				ori_emb = self.memory.emb[neighbors.flatten()]
+				updated_emb_map = policy_map * changed_emb + (1 - policy_map) * ori_emb
+				updated_emb_sample = policy_sample * changed_emb + (1 - policy_sample) * ori_emb
+				reward_map = self.get_reward(idxs, updated_emb_map).detach()
+				reward_sample = self.get_reward(idxs, updated_emb_sample).detach()
+				advantage = reward_sample - reward_map
+				loss = -distr.log_prob(policy) * Variable(advantage).expand_as(policy)
+				loss = loss.sum()
+				probs = probs.clamp(1e-15, 1 - 1e-15)
+				entropy_loss = -probs * torch.log(probs)
+				entropy_loss = self.beta * entropy_loss.sum()
+				loss = (loss - entropy_loss) / bs / self.n_update_neighbors
+				self.memory.emb[neighbors.flatten()] = updated_emb_sample
+				policy_loss += loss
+				reward += reward_sample
+
+		# compute loss
+		pos_score, neg_score = self.compute_score(src_idxs, dst_idxs, neg_idxs)
+		return pos_score, neg_score, policy_loss, reward
+
+	def get_reward(self, idxs, neighbor_emb):
+		reg_strength = 0.01
+		central_emb = self.memory.emb[idxs].repeat(1, self.n_update_neighbors).view(-1, self.emb_dim)
+		central_emb_norm = F.normalize(central_emb, p=2, dim=1).detach()
+		neighbor_emb_norm = F.normalize(neighbor_emb, p=2, dim=1)
+		cos_sim = torch.matmul(central_emb_norm, neighbor_emb_norm.t())
+		# ======================================================================
+		# 计算正则项，这里使用的是中心嵌入的 L2 范数
+		reg_term = torch.norm(central_emb, p=2, dim=1).mean()
+
+		# 奖励是余弦相似度的平均值减去正则项的缩放版本
+		# self.reg_strength 是正则项的权重，控制正则项的强度
+		reward = cos_sim.mean() - reg_strength * reg_term
+		# ======================================================================
+		return reward
+
+	def compute_sim(self, src_idxs):
+		src_norm = F.normalize(self.memory.emb[src_idxs], p=2, dim=1)
+		emb_norm = F.normalize(self.memory.emb, p=2, dim=1)
+		cos_sim = torch.matmul(src_norm, emb_norm.t())
+		sorted_cos_sim, idx = cos_sim.sort(descending=True)
+		return sorted_cos_sim, idx
+
+	def compute_score(self, src_idxs, dst_idxs, neg_idxs):
+		pos_score = torch.sum(self.memory.emb[src_idxs] * self.memory.emb[dst_idxs], dim=1)
+		neg_score = torch.sum(self.memory.emb[src_idxs] * self.memory.emb[neg_idxs], dim=1)
+		return pos_score.sigmoid(), neg_score.sigmoid()
+
+	def reset_graph(self):
+		self.memory.__init_memory__()
+
+	def set_neighbor_finder(self, neighbor_finder):
+		self.neighbor_finder = neighbor_finder
+
+	def detach_memory(self):
+		self.memory.detach_memory()
+
+	def back_up_memory(self):
+		return self.memory.emb.clone()
+
+	def restore_memory(self, back_up):
+		self.memory.emb = nn.Parameter(back_up)
