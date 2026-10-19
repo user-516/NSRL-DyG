@@ -20,7 +20,7 @@ ModelName = 'NSRLDyG'
 parser = argparse.ArgumentParser('NSRLDyG')
 parser.add_argument('-d', '--data', type=str, default='uci')
 parser.add_argument('--data_root', type=str,
-                    default=os.environ.get('NSRL_DATA_ROOT', 'E:/dataset/Ada-DyGNN-dataset'),
+                    default=os.environ.get('NSRL_DATA_ROOT', './data'),
                     help='Directory holding ml_<name>.csv, either flat or one subdir per dataset')
 parser.add_argument('--bs', type=int, default=64, help='Batch_size')
 parser.add_argument('--n_degree', type=int, default=20, help='TFDGA sequence length L')
