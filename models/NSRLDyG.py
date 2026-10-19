@@ -306,9 +306,11 @@ class MultiScaleTemporalAttention(nn.Module):
         self.mlp = ResidualMLP(embed_dim * 2 , 128, output_dim,3).to(_DEV)
 
 		
-    def forward(self, neighbors, center_emb, current_time, edge_times):
+    def forward(self, neighbors, center_emb, current_time, edge_times,
+                return_weights=False):
         B, N, E = neighbors.shape  # E is the embed_dim
         multi_scale_messages = []
+        weight_list = []
         # 实例化 TimeEncode 对象
         time_encode = TimeEncode(20,20).to(_DEV)
         b = 1
@@ -342,6 +344,7 @@ class MultiScaleTemporalAttention(nn.Module):
          
             # Append the transformed and aggregated message for this scale
             multi_scale_messages.append(agg_neighbors)
+            weight_list.append(att_weights)
         
         # Concatenate messages from all scales
         fused_message = torch.cat(multi_scale_messages, dim=1)   #(16,64*3)
@@ -351,6 +354,8 @@ class MultiScaleTemporalAttention(nn.Module):
         # Reshape to (B, 2 * N, output_dim) as we have double the number of elements after concatenation
         # print(final_output.shape)
         final_output = final_output.view(B, self.n_out, self.output_dim)
+        if return_weights:
+            return final_output, torch.stack(weight_list, dim=1)
         return final_output
 
 
@@ -505,12 +510,14 @@ class NSRLDyG(nn.Module):
 			dt = torch.as_tensor((cur - et) / self.tot_time, dtype=torch.float32, device=dev)
 			x_i = self.memory.emb[nb_t]
 			x_c = self.memory.emb[ids]
-			z = (1.0 / (1.0 + self.gamma * dt)).unsqueeze(-1) * x_i
-			pair = torch.cat([x_c.unsqueeze(1).expand(-1, N, -1), z], dim=-1)
-			score = torch.relu(pair @ self.sel_Wg) @ self.sel_a
-			score = score.masked_fill(mk_t <= 0, -1e9)
-			alpha = torch.softmax(score, dim=1) * mk_t
-			c = alpha.unsqueeze(-1) * (z @ self.sel_Wm)
+			# Reuse the TFDGA attention of the parallel path, so that both selection
+			# mechanisms share the same front end and differ only in how they gate.
+			msct = MultiScaleTemporalAttention(3, self.emb_dim, self.emb_dim // 2,
+			                                   n_out=2 * self.n_neighbors)
+			center_emb = torch.matmul(x_c, self.W_g).unsqueeze(1).repeat(1, N, 2)
+			_, att = msct(x_i, center_emb, cur, et, return_weights=True)
+			alpha = att.mean(dim=1) * mk_t
+			c = alpha.unsqueeze(-1) * (x_i @ self.sel_Wm)
 			sides[tag] = dict(nb=nb_t, dt=dt, valid=mk_t, c=c,
 			                  m_raw=torch.relu(c.sum(dim=1)))
 
