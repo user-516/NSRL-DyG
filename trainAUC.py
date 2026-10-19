@@ -28,6 +28,10 @@ parser.add_argument('--n_update_degree', type=int, default=20, help='MDP candida
 parser.add_argument('--n_epoch', type=int, default=30, help='Number of epochs')
 parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
 parser.add_argument('--lambda2', type=float, default=0.1, help='Entropy weight lambda_2 of Eq (19)')
+parser.add_argument('--selection_mode', type=str, default='parallel',
+                    choices=['parallel', 'mdp', 'mdp_noh'],
+                    help="parallel = the original gate; mdp = sequential MDP with h_{<i}; "
+                         "mdp_noh = same rollout with h_{<i} withheld from the state")
 parser.add_argument('--rl_coef', type=float, default=0.05,
                     help='Weight on the policy-gradient term; the advantage is batch-normalised, '
                          'so the RL loss is O(1) per step and must be scaled down against the BCE term')
@@ -72,6 +76,7 @@ model = NSRLDyG(node_features.shape[0], n_neighbors=n_neighbors, n_update_neighb
 				 edge_dim=edge_features.shape[1], emb_dim=64, message_dim=64,neighbor_finder=train_neighbor_finder,
 				 edge_feat=edge_features, tot_time=tot_time, device=device)
 model.lambda2 = args.lambda2
+model.selection_mode = args.selection_mode
 criterion = torch.nn.BCELoss()
 # Only trainable parameters.  memory.emb is a buffer that forward() updates in place;
 # the update carries a grad_fn, so after the first event that tensor becomes a non-leaf

@@ -442,12 +442,152 @@ class NSRLDyG(nn.Module):
 		# Inference-time switch used by domino_probe.py: when False the gate is bypassed
 		# and every candidate neighbour's representation is updated, i.e. the w/o-RNS arm.
 		self.use_rns = True
+		# ---- Sequential MDP path (selection_mode != 'parallel') -----------------
+		# State s_i = x_i || q_i || cos(dt*omega) || h_{<i}, action a_i in {0,1},
+		# transition h_{<i+1} = h_{<i} + a_i c_i, reward = marginal drop in L_p.
+		self.selection_mode = 'parallel'
+		d, dm = self.emb_dim, self.message_dim
+		self.sel_Wg = nn.Parameter(torch.zeros((2 * d, d)).to(self.device))
+		self.sel_a = nn.Parameter(torch.zeros(d).to(self.device))
+		self.sel_Wm = nn.Parameter(torch.zeros((d, dm // 2)).to(self.device))
+		self.sel_Wq = nn.Parameter(torch.zeros((dm // 2 * 2 + dm + d, d)).to(self.device))
+		self.sel_W1 = nn.Parameter(torch.zeros((4 * d, d)).to(self.device))
+		self.sel_W2 = nn.Parameter(torch.zeros((d, 1)).to(self.device))
+		for _p in (self.sel_Wg, self.sel_Wm, self.sel_Wq, self.sel_W1, self.sel_W2):
+			nn.init.xavier_normal_(_p)
+		self.register_buffer('sel_omega', 1.0 / (10.0 ** (torch.arange(d).float() / d)))
 		# self.mlp1 = ResidualMLP1(32 , 64, 32,3).to(_DEV)
 
 	
 	
 	
+	def _lp_mdp(self, h_s, h_d, h_e, mem_s, mem_d, target):
+		"""Eq (22) on the message assembled from the partial aggregate (h_s, h_d)."""
+		msg = torch.cat([h_s, h_d, h_e], dim=-1)
+		rs = torch.tanh(torch.cat([mem_s, msg], dim=-1) @ self.W_uc)
+		rd = torch.tanh(torch.cat([mem_d, msg], dim=-1) @ self.W_uc)
+		score = torch.sigmoid((rs * rd).sum(dim=-1))
+		return F.binary_cross_entropy(score, target, reduction='none')
+
+	def _forward_mdp(self, src_idxs, dst_idxs, neg_idxs, edge_idxs, timestamps):
+		"""Sequential neighbor selection as a finite-horizon MDP.
+
+		State   s_i = x_i || q_i || cos(dt_i * omega) || h_{<i}
+		Action  a_i in {0,1}, whether candidate i enters the aggregation
+		Trans.  h_{<i+1} = h_{<i} + a_i * c_i
+		Reward  r_i = L_p(h_{<i}) - L_p(h_{<i+1})
+
+		Candidates are the top n_update_degree neighbours of each endpoint, merged
+		and ordered by recency (smallest dt first).  With selection_mode == 'mdp_noh'
+		the running aggregate is withheld from the state, which isolates the effect of
+		h_{<i} from the effect of the binary gate itself.
+		"""
+		dev = self.device
+		B = len(src_idxs)
+		N, K = self.n_neighbors, self.n_update_neighbors
+		src_t = torch.as_tensor(src_idxs, dtype=torch.long, device=dev)
+		dst_t = torch.as_tensor(dst_idxs, dtype=torch.long, device=dev)
+		neg_t = torch.as_tensor(neg_idxs, dtype=torch.long, device=dev)
+		eidx = torch.as_tensor(edge_idxs, dtype=torch.long, device=dev)
+
+		mem_s_pre = self.memory.emb[src_t].clone()
+		mem_d_pre = self.memory.emb[dst_t].clone()
+		mem_n_pre = self.memory.emb[neg_t].clone()
+		h_e = torch.relu(self.edge_feat[eidx] @ self.W_e)
+
+		sides = {}
+		for tag, ids in (('s', src_t), ('d', dst_t)):
+			nb, _, et, mk = self.neighbor_finder.get_temporal_neighbor(
+				ids, timestamps, N, return_mask=True)
+			nb_t = torch.as_tensor(nb, dtype=torch.long, device=dev)
+			mk_t = torch.as_tensor(mk, dtype=torch.float32, device=dev)
+			cur = np.repeat(np.expand_dims(timestamps, 1), N, 1)
+			dt = torch.as_tensor((cur - et) / self.tot_time, dtype=torch.float32, device=dev)
+			x_i = self.memory.emb[nb_t]
+			x_c = self.memory.emb[ids]
+			z = (1.0 / (1.0 + self.gamma * dt)).unsqueeze(-1) * x_i
+			pair = torch.cat([x_c.unsqueeze(1).expand(-1, N, -1), z], dim=-1)
+			score = torch.relu(pair @ self.sel_Wg) @ self.sel_a
+			score = score.masked_fill(mk_t <= 0, -1e9)
+			alpha = torch.softmax(score, dim=1) * mk_t
+			c = alpha.unsqueeze(-1) * (z @ self.sel_Wm)
+			sides[tag] = dict(nb=nb_t, dt=dt, valid=mk_t, c=c,
+			                  m_raw=torch.relu(c.sum(dim=1)))
+
+		msg_ctx = torch.cat([sides['s']['m_raw'], sides['d']['m_raw'], h_e], dim=-1)
+
+		# candidates: last K per endpoint, merged and sorted by recency
+		cand_c = torch.cat([sides['s']['c'][:, -K:], sides['d']['c'][:, -K:]], dim=1)
+		cand_x = torch.cat([self.memory.emb[sides['s']['nb']][:, -K:],
+		                    self.memory.emb[sides['d']['nb']][:, -K:]], dim=1)
+		cand_dt = torch.cat([sides['s']['dt'][:, -K:], sides['d']['dt'][:, -K:]], dim=1)
+		cand_v = torch.cat([sides['s']['valid'][:, -K:], sides['d']['valid'][:, -K:]], dim=1)
+
+		order = torch.argsort(cand_dt, dim=1)                     # most recent first
+		gather = lambda t: torch.gather(t, 1, order.unsqueeze(-1).expand(-1, -1, t.size(-1)))
+		cand_c, cand_x = gather(cand_c), gather(cand_x)
+		cand_dt = torch.gather(cand_dt, 1, order)
+		cand_v = torch.gather(cand_v, 1, order)
+		is_src = (order < K).float()
+
+		q = torch.relu(torch.cat([msg_ctx.unsqueeze(1).expand(-1, 2 * K, -1),
+		                          cand_x], dim=-1) @ self.sel_Wq)
+		t_feat = torch.cos(cand_dt.unsqueeze(-1) * self.sel_omega)
+
+		half = self.message_dim // 2
+		h_s = torch.zeros(B, half, device=dev)
+		h_d = torch.zeros(B, half, device=dev)
+		pairs = [(h_s, h_d)]
+		log_pi, ent = [], []
+		with torch.no_grad():
+			h_s_n, h_d_n = h_s.clone(), h_d.clone()
+		for i in range(2 * K):
+			h_ctx = torch.cat([h_s, h_d], dim=-1)
+			if self.selection_mode == 'mdp_noh':
+				h_ctx = torch.zeros_like(h_ctx).detach()
+			s_i = torch.cat([cand_x[:, i], q[:, i], t_feat[:, i], h_ctx], dim=-1).detach()
+			p_i = torch.sigmoid(torch.relu(s_i @ self.sel_W1) @ self.sel_W2).squeeze(-1)
+			p_i = p_i.clamp(1e-6, 1 - 1e-6)
+			with torch.no_grad():
+				a_i = (Bernoulli(p_i.detach()).sample() if self.training
+				       else (p_i.detach() >= 0.5).float()) * cand_v[:, i]
+				h_s = h_s + (a_i * is_src[:, i]).unsqueeze(-1) * cand_c[:, i]
+				h_d = h_d + (a_i * (1 - is_src[:, i])).unsqueeze(-1) * cand_c[:, i]
+				pairs.append((h_s.clone(), h_d.clone()))
+			log_pi.append(Bernoulli(p_i).log_prob(a_i) * cand_v[:, i])
+			ent.append(-(p_i * torch.log(p_i) + (1 - p_i) * torch.log(1 - p_i)) * cand_v[:, i])
+
+		one = torch.ones(B, device=dev)
+		with torch.no_grad():
+			L_pre = torch.stack([self._lp_mdp(hs, hd, h_e, mem_s_pre, mem_d_pre, one)
+			                     for hs, hd in pairs[:-1]], dim=1)
+			L_sel = self._lp_mdp(pairs[-1][0], pairs[-1][1], h_e, mem_s_pre, mem_d_pre, one)
+			returns = L_pre - L_sel.unsqueeze(1)
+
+		if self.training:
+			adv = returns
+			sd = adv.std()
+			adv = adv / sd.clamp(min=1e-6) if sd > 1e-6 else adv * 0.0
+			adv = adv.clamp(-2.0, 2.0)
+			policy_loss = (-(torch.stack(log_pi, 1) * adv).sum()
+			               - self.beta * torch.stack(ent, 1).sum()) / B
+		else:
+			policy_loss = torch.zeros((), device=dev)
+
+		msg_sel = torch.cat([h_s, h_d, h_e], dim=-1)
+		rs = torch.tanh(torch.cat([mem_s_pre, msg_sel], dim=-1) @ self.W_uc)
+		rd = torch.tanh(torch.cat([mem_d_pre, msg_sel], dim=-1) @ self.W_uc)
+		rn = torch.tanh(torch.cat([mem_n_pre, msg_sel], dim=-1) @ self.W_uc)
+		pos_score = torch.sigmoid((rs * rd).sum(dim=-1))
+		neg_score = torch.sigmoid((rs * rn).sum(dim=-1))
+		with torch.no_grad():
+			self.memory.emb[src_t] = rs.detach()
+			self.memory.emb[dst_t] = rd.detach()
+		return pos_score, neg_score, policy_loss, returns.mean().detach()
+
 	def forward(self, src_idxs, dst_idxs, neg_idxs, edge_idxs, timestamps):
+		if self.selection_mode != 'parallel':
+			return self._forward_mdp(src_idxs, dst_idxs, neg_idxs, edge_idxs, timestamps)
 		# GRU模块
 		custom_gru = CustomGRU(input_size=32, hidden_size=32)
 		# 指定设备
