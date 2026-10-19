@@ -279,8 +279,10 @@ class TimeEncode(nn.Module):
     
     def reset_parameters(self):
         # 创建一个对角线为1/10^n的矩阵，其中 n 为对角线索引
-        diag_values = 1 / 10 ** np.arange(self.output_dim, dtype=np.float32)
-        weight_matrix = np.diag(diag_values)
+        # float64 avoids the overflow that 10**j hits for j above ~38; values below the
+        # float32 range simply underflow to zero when the matrix is cast.
+        diag_values = 1.0 / (10.0 ** np.arange(self.output_dim, dtype=np.float64))
+        weight_matrix = np.diag(diag_values).astype(np.float32)
         self.w.weight = nn.Parameter(torch.from_numpy(weight_matrix).reshape(self.input_dim, self.output_dim))
         self.w.bias = nn.Parameter(torch.zeros(self.output_dim))
         self.w.weight.requires_grad = False
@@ -312,7 +314,8 @@ class MultiScaleTemporalAttention(nn.Module):
         multi_scale_messages = []
         weight_list = []
         # 实例化 TimeEncode 对象
-        time_encode = TimeEncode(20,20).to(_DEV)
+        n_nb = neighbors.size(1)
+        time_encode = TimeEncode(n_nb, n_nb).to(_DEV)
         b = 1
         for scale in range(self.num_scales):
             time_diff = current_time - edge_times
