@@ -16,6 +16,7 @@ from utils.utils import get_parameter_sizes
 
 # n_degree 是时间频率聚合(TFDGA)里考虑的邻居数量，也就是论文里的序列长度 L。
 # n_update_degree 是 MDP 候选集的规模：src 和 dst 各取这么多邻居，rollout 步数为 2*n_update_degree。
+SEED = 2024          # the single fixed seed used by every run
 ModelName = 'NSRLDyG'
 parser = argparse.ArgumentParser('NSRLDyG')
 parser.add_argument('-d', '--data', type=str, default='uci')
@@ -35,16 +36,15 @@ parser.add_argument('--selection_mode', type=str, default='parallel',
 parser.add_argument('--rl_coef', type=float, default=0.05,
                     help='Weight on the policy-gradient term; the advantage is batch-normalised, '
                          'so the RL loss is O(1) per step and must be scaled down against the BCE term')
-parser.add_argument('--seed', type=int, default=2024, help='Random seed')
 log_to_file = True
 args = parser.parse_args()
 
 # A single seed for every source of randomness, so that the reported mean and standard
 # deviation can actually be reproduced.
-random.seed(args.seed)
-np.random.seed(args.seed)
-torch.manual_seed(args.seed)
-torch.cuda.manual_seed_all(args.seed)
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
 dataset = args.data
 Epoch = args.n_epoch
 Batchsize = args.bs

@@ -55,6 +55,7 @@ from utils.data_processing import get_data
 from utils.utils import get_neighbor_finder
 
 DET_SEED = 12345
+SEED = 2024          # the single fixed seed used by every run
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +77,6 @@ def parse_args():
                     help='threshold used for the affected-node count')
     ap.add_argument('--block', type=int, default=50,
                     help='block size for the AP damage curve')
-    ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--out', default='figures/domino')
     return ap.parse_args()
 
@@ -178,8 +178,8 @@ def run_arm(base_model, finder, full, args, st, u, v, t0, noise_edge, noise_neg,
 # ---------------------------------------------------------------------------
 def main():
     args = parse_args()
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     node_features, edge_features, full, train_data, val_data, test_data, _, _, _ = \
