@@ -12,3 +12,6 @@ figures/
 data/
 .vscode/
 .idea/
+
+# Machine-specific launcher (holds an absolute dataset path)
+run_local.ps1
