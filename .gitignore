@@ -1,0 +1,14 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Training artefacts
+log/
+Ap-result/
+figures/
+*.pth
+
+# Local data and editor files
+data/
+.vscode/
+.idea/

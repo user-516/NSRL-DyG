@@ -1,6 +1,5 @@
 import torch
 import numpy as np
-import pandas as pd
 import random
 
 
@@ -27,19 +26,59 @@ def add_noise_to_node_features(node_features, noise_level):
     return noisy_node_features
 
 
-def get_data(DatasetName):
-	graph = pd.read_csv("./data/ml_{}.csv".format(DatasetName))
-	edge_features = np.load("./data/ml_{}.npy".format(DatasetName))
-	node_features = np.load("./data/ml_{}_node.npy".format(DatasetName))
+def _dataset_paths(DatasetName, data_root):
+	"""Locate the three files of a dataset.
+
+	Two layouts are accepted: `<root>/<Name>/ml_<Name>.*` (one directory per dataset, as
+	in E:/dataset/Ada-DyGNN-dataset) and the flat `<root>/ml_<Name>.*`.
+	"""
+	import os
+	candidates = [os.path.join(data_root, DatasetName), data_root]
+	for base in candidates:
+		graph = os.path.join(base, "ml_{}.csv".format(DatasetName))
+		if os.path.exists(graph):
+			return (graph,
+					os.path.join(base, "ml_{}.npy".format(DatasetName)),
+					os.path.join(base, "ml_{}_node.npy".format(DatasetName)))
+	raise FileNotFoundError(
+		"ml_{0}.csv not found under {1} (looked in {2}/{0} and {2})".format(
+			DatasetName, data_root, data_root))
+
+
+def _load_graph_csv(path):
+	"""Read an ml_*.csv into named numpy arrays, mapping columns by header name.
+
+	The files in the wild come in two layouts — `,u,i,ts,label,idx` (uci, wikipedia,
+	lastfm, enron, USLegis, CanParl) and `,u,i,ts,label,timestamp,idx` (UCI-Msg) — so the
+	column index of `idx` differs. Resolving by name handles both.
+
+	Kept on numpy rather than pandas so the pipeline needs no extra dependency.
+	"""
+	with open(path, 'r') as fh:
+		header = [c.strip() for c in fh.readline().strip().split(',')]
+	arr = np.loadtxt(path, delimiter=',', skiprows=1)
+	out = {}
+	for name in ('u', 'i', 'ts', 'label', 'idx'):
+		if name not in header:
+			raise ValueError("column %r missing from %s (header: %s)" % (name, path, header))
+		out[name] = arr[:, header.index(name)].astype(np.int64)
+	return out
+
+
+def get_data(DatasetName, data_root="./data"):
+	graph_path, edge_path, node_path = _dataset_paths(DatasetName, data_root)
+	graph = _load_graph_csv(graph_path)
+	edge_features = np.load(edge_path)
+	node_features = np.load(node_path)
 	# fommer_node_features = np.load("./data/ml_{}_node.npy".format(DatasetName))
 	# node_features = add_noise_to_node_features(fommer_node_features,0.1)
-	val_time, test_time = list(np.quantile(graph.ts, [0.8, 0.9]))
+	val_time, test_time = list(np.quantile(graph['ts'], [0.8, 0.9]))
 
-	src = graph.u.values
-	dst = graph.i.values
-	edge_idxs = graph.idx.values-1
-	labels = graph.label.values
-	timestamps = graph.ts.values
+	src = graph['u']
+	dst = graph['i']
+	edge_idxs = graph['idx'] - 1
+	labels = graph['label']
+	timestamps = graph['ts']
 
 	full_data = Data(src, dst, timestamps, edge_idxs, labels)
 
@@ -50,8 +89,9 @@ def get_data(DatasetName):
 	test_node_set = set(src[timestamps > val_time]) | (set(dst[timestamps > val_time]))
 
 	new_test_node_set = set(random.sample(sorted(test_node_set), int(0.1 * n_total_nodes)))
-	new_test_src_mask = graph.u.map(lambda x: x in new_test_node_set).values
-	new_test_dst_mask = graph.i.map(lambda x: x in new_test_node_set).values
+	held_out = np.fromiter(new_test_node_set, dtype=src.dtype, count=len(new_test_node_set))
+	new_test_src_mask = np.isin(src, held_out)
+	new_test_dst_mask = np.isin(dst, held_out)
 
 	observed_edges_mask = np.logical_and(~new_test_src_mask, ~new_test_dst_mask)
 
@@ -67,8 +107,8 @@ def get_data(DatasetName):
 	val_mask = np.logical_and(timestamps > val_time, timestamps <= test_time)
 	test_mask = timestamps > test_time
 
-	edge_contains_new_node_mask = np.array(
-		[a in new_node_set or b in new_node_set for a, b in zip(src, dst)])
+	new_arr = np.fromiter(new_node_set, dtype=src.dtype, count=len(new_node_set))
+	edge_contains_new_node_mask = np.logical_or(np.isin(src, new_arr), np.isin(dst, new_arr))
 	new_node_val_mask = np.logical_and(edge_contains_new_node_mask, val_mask)
 	new_node_test_mask = np.logical_and(edge_contains_new_node_mask, test_mask)
 

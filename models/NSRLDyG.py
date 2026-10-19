@@ -8,6 +8,8 @@ from torch.autograd import Variable
 
 
 from torch.nn import MSELoss
+
+_DEV = "cuda" if torch.cuda.is_available() else "cpu"
 class BlockTransformer(nn.Module):
     def __init__(
         self,
@@ -293,28 +295,30 @@ class TimeEncode(nn.Module):
 
 
 class MultiScaleTemporalAttention(nn.Module):
-    def __init__(self, num_scales, embed_dim, output_dim):
+    def __init__(self, num_scales, embed_dim, output_dim, n_out=40):
         super().__init__()
         self.num_scales = num_scales
-        self.W_g = nn.ModuleList([nn.Linear(2 * embed_dim, output_dim) for _ in range(num_scales)]).to('cuda') # 修改线性层以拼接后的维度
+        self.n_out = n_out
+        self.output_dim = output_dim
+        self.W_g = nn.ModuleList([nn.Linear(2 * embed_dim, output_dim) for _ in range(num_scales)]).to(_DEV) # 修改线性层以拼接后的维度
         self.decay_rates = nn.ParameterList([nn.Parameter(torch.randn(1)) for _ in range(num_scales)])
-        self.final_linear = nn.Linear(num_scales * output_dim * 2, output_dim * 20 * 2).to('cuda')  # 修改最终线性层输入维度
-        self.mlp = ResidualMLP(embed_dim * 2 , 128, output_dim,3).to('cuda')
+        self.final_linear = nn.Linear(num_scales * output_dim * 2, output_dim * n_out).to(_DEV)  # 修改最终线性层输入维度
+        self.mlp = ResidualMLP(embed_dim * 2 , 128, output_dim,3).to(_DEV)
 
 		
     def forward(self, neighbors, center_emb, current_time, edge_times):
         B, N, E = neighbors.shape  # E is the embed_dim
         multi_scale_messages = []
         # 实例化 TimeEncode 对象
-        time_encode = TimeEncode(20,20).to('cuda')
+        time_encode = TimeEncode(20,20).to(_DEV)
         b = 1
         for scale in range(self.num_scales):
             time_diff = current_time - edge_times
-            # damp = torch.exp(-self.decay_rates[scale].clamp(min=1e-15).detach().cpu()* time_diff).to('cuda')  #(16,20)
+            # damp = torch.exp(-self.decay_rates[scale].clamp(min=1e-15).detach().cpu()* time_diff).to(_DEV)  #(16,20)
 			# =exp⁡(-(Δt^2)/(2b^2 )),这里高斯带宽取b = 3
-            damp = torch.exp(-self.decay_rates[scale].clamp(min=1e-15).detach().cpu()* (time_diff**2)/(2*pow(b,2))).to('cuda')  #(16,20)
+            damp = torch.exp(-self.decay_rates[scale].clamp(min=1e-15).detach().cpu()* (time_diff**2)/(2*pow(b,2))).to(_DEV)  #(16,20)
             damp = damp.detach().cpu()
-            damp = time_encode(torch.tensor(np.float32(damp)).to('cuda'))
+            damp = time_encode(torch.tensor(np.float32(damp)).to(_DEV))
             # Concatenate center_emb and neighbors
             concat_input = torch.cat([center_emb, neighbors], dim=2) #（16，20，128）
             
@@ -346,7 +350,7 @@ class MultiScaleTemporalAttention(nn.Module):
         
         # Reshape to (B, 2 * N, output_dim) as we have double the number of elements after concatenation
         # print(final_output.shape)
-        final_output = final_output.view(B, 40, 32)
+        final_output = final_output.view(B, self.n_out, self.output_dim)
         return final_output
 
 
@@ -367,7 +371,7 @@ class EmbeddingCombiner(nn.Module):
         current_dst = current_dst.unsqueeze(0)  
 
         # 初始化 LSTM 的隐藏状态和细胞状态为 0
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device = _DEV if torch.cuda.is_available() else 'cpu'
         h0 = torch.zeros(1, prev_dst.size(1), self.lstm.hidden_size).to(device)
         c0 = torch.zeros(1, prev_dst.size(1), self.lstm.hidden_size).to(device)
 
@@ -390,7 +394,9 @@ class NSRLDyG(nn.Module):
 				 edge_dim, emb_dim, message_dim,
 				 neighbor_finder, edge_feat, tot_time, device='cpu'):
 		super(NSRLDyG, self).__init__()
-		torch.manual_seed(0)
+		# No seeding here on purpose: the run seed belongs to the caller.  Seeding
+		# inside __init__ would override it and make every run bit-identical,
+		# which would render the reported standard deviations meaningless.
 		# graph
 		self.damp_list = []
 		self.n_nodes = n_nodes
@@ -433,7 +439,10 @@ class NSRLDyG(nn.Module):
 		nn.init.xavier_normal_(self.W_1)
 		nn.init.xavier_normal_(self.W_2)
 		self.beta = 0.1
-		# self.mlp1 = ResidualMLP1(32 , 64, 32,3).to('cuda')
+		# Inference-time switch used by domino_probe.py: when False the gate is bypassed
+		# and every candidate neighbour's representation is updated, i.e. the w/o-RNS arm.
+		self.use_rns = True
+		# self.mlp1 = ResidualMLP1(32 , 64, 32,3).to(_DEV)
 
 	
 	
@@ -448,9 +457,9 @@ class NSRLDyG(nn.Module):
 		# 将模型移动到指定的设备上
 		custom_gru = custom_gru.to(device)
 
-		MultiScaleTemporalAttention_model = MultiScaleTemporalAttention(3, self.emb_dim, self.emb_dim//2)
+		MultiScaleTemporalAttention_model = MultiScaleTemporalAttention(3, self.emb_dim, self.emb_dim//2, n_out=2*self.n_neighbors)
 		message = []
-		model_EmbeddingCombiner = EmbeddingCombiner().to('cuda')
+		model_EmbeddingCombiner = EmbeddingCombiner().to(_DEV)
 		for i, idxs in enumerate([src_idxs, dst_idxs]):
 
 			# 获取给定节点 idxs 在指定时间戳 timestamps 下的 n_neighbors 个最近邻节点及其对应的边创建时间 edge_times。
@@ -480,20 +489,20 @@ class NSRLDyG(nn.Module):
 			center_emb_prev = torch.matmul(self.memory.emb[idxs], self.W_g).to(self.device)
 			h = custom_gru(h[:,i,:],center_emb_prev)
 			# (16,40,32)
-			h = h.unsqueeze(dim=1).repeat(1,40,1)
-			h = h + torch.matmul(self.memory.emb[idxs], self.W_g).unsqueeze(dim=1).repeat(1, self.n_neighbors // 5 , 1)
+			h = h.unsqueeze(dim=1).repeat(1, 2 * self.n_neighbors, 1)
+			h = h + torch.matmul(self.memory.emb[idxs], self.W_g).unsqueeze(dim=1).repeat(1, 2 * self.n_neighbors, 1)
 			
 			# =========================================================================
 
 			message.append(h)
-		prev_src = self.memory.emb[src_idxs].to('cuda')
+		prev_src = self.memory.emb[src_idxs].to(_DEV)
 		h = torch.cat((message[0], message[1]), dim=2).sum(dim=1).relu()
 		h_e = torch.matmul(self.edge_feat[edge_idxs], self.W_e).relu()
 		h = torch.cat((h, h_e), dim=1)
 
-		to_updated_src = torch.matmul(torch.cat((self.memory.emb[src_idxs], h), dim=1), self.W_uc).tanh().to('cuda')
-		to_updated_dst = torch.matmul(torch.cat((self.memory.emb[dst_idxs], h), dim=1), self.W_uc).tanh().to('cuda')
-		prev_dst = self.memory.emb[dst_idxs].to('cuda')
+		to_updated_src = torch.matmul(torch.cat((self.memory.emb[src_idxs], h), dim=1), self.W_uc).tanh().to(_DEV)
+		to_updated_dst = torch.matmul(torch.cat((self.memory.emb[dst_idxs], h), dim=1), self.W_uc).tanh().to(_DEV)
+		prev_dst = self.memory.emb[dst_idxs].to(_DEV)
             
 		self.memory.emb[src_idxs] = to_updated_src      
 		self.memory.emb[dst_idxs] = to_updated_dst  
@@ -502,7 +511,7 @@ class NSRLDyG(nn.Module):
 		# self.memory.emb[dst_idxs] = model_EmbeddingCombiner(prev_dst,to_updated_dst)
 
 		# changed_emb_lt = []
-		model = MultiHeadAttention(input_dim=128, num_heads=16, hidden_dim=128,device='cuda')
+		model = MultiHeadAttention(input_dim=128, num_heads=16, hidden_dim=128,device=_DEV)
 		# prop
 		for idxs in [src_idxs, dst_idxs]:
 			neighbors, _, edge_times = self.neighbor_finder.get_temporal_neighbor(idxs, timestamps,
@@ -548,9 +557,13 @@ class NSRLDyG(nn.Module):
 			distr = Bernoulli(probs)
 			policy = distr.sample()
 			if not self.training:
-				mask = policy_map.repeat(1, 1, self.emb_dim).flatten().view(-1, self.emb_dim)
-				self.memory.emb[neighbors.flatten()] = mask * changed_emb + (1 - mask) * self.memory.emb[
-					neighbors.flatten()]
+				if self.use_rns:
+					mask = policy_map.repeat(1, 1, self.emb_dim).flatten().view(-1, self.emb_dim)
+					self.memory.emb[neighbors.flatten()] = mask * changed_emb + (1 - mask) * self.memory.emb[
+						neighbors.flatten()]
+				else:
+					# w/o-RNS arm: no gating, every candidate neighbour is updated.
+					self.memory.emb[neighbors.flatten()] = changed_emb
 			else:
 				policy_map = policy_map.repeat(1, 1, self.emb_dim).flatten().view(-1, self.emb_dim)
 				policy_sample = policy.repeat(1, 1, self.emb_dim).flatten().view(-1, self.emb_dim)
@@ -603,7 +616,10 @@ class NSRLDyG(nn.Module):
 		return pos_score.sigmoid(), neg_score.sigmoid()
 
 	def reset_graph(self):
-		self.memory.__init_memory__()
+		# Restore the snapshot taken at construction rather than redrawing, so that
+		# every epoch starts from the same memory state and the global RNG is left
+		# untouched.
+		self.memory.reset()
 
 	def set_neighbor_finder(self, neighbor_finder):
 		self.neighbor_finder = neighbor_finder
@@ -615,4 +631,7 @@ class NSRLDyG(nn.Module):
 		return self.memory.emb.clone()
 
 	def restore_memory(self, back_up):
-		self.memory.emb = nn.Parameter(back_up)
+		# requires_grad must be forced off: nn.Parameter defaults to True, and a
+		# grad-requiring leaf would make the in-place write in forward() raise
+		# "a leaf Variable that requires grad is being used in an in-place operation".
+		self.memory.emb = nn.Parameter(back_up.detach().clone(), requires_grad=False)

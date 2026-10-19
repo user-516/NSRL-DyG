@@ -108,7 +108,7 @@ class NeighborFinder:
 			   self.node_to_edge_idxs[src_idx][:i], \
 			   self.node_to_edge_time_stamps[src_idx][:i]
 
-	def get_temporal_neighbor(self, src_nodes, timestamps, n_neighbors=20):
+	def get_temporal_neighbor(self, src_nodes, timestamps, n_neighbors=20, return_mask=False):
 		"""
 			Given a list of users ids and relative cut times, extracts
 			a sampled temporal neighborhood of each user in the list.
@@ -135,6 +135,10 @@ class NeighborFinder:
 		# each entry in position (i,j) represent the interaction index
 		# of an interaction between user src_idx_l[i] and item neighbors[i,j]
 		# happening before cut_time_l[i]
+		mask = np.zeros((len(src_nodes), tmp_n_neighbors)).astype(np.float32)
+		# 1.0 for a genuine neighbour, 0.0 for the zero padding used to fill a
+		# short history. NOTE: node 0 is a real node, so without this mask the
+		# padding is silently treated as a neighbour of node 0.
 
 		for i, (src_node, timestamp) in enumerate(zip(src_nodes, timestamps)):
 			src_neighbors, src_edge_idxs, src_edge_times = \
@@ -150,11 +154,13 @@ class NeighborFinder:
 					neighbors[i, :] = src_neighbors[sample_idx]
 					edge_times[i, :] = src_edge_times[sample_idx]
 					edge_idxs[i, :] = src_edge_idxs[sample_idx]
+					mask[i, :] = 1.0
 					# re-sort based on time
 					pos = edge_times[i, :].argsort()
 					neighbors[i, :] = neighbors[i, :][pos]
 					edge_times[i, :] = edge_times[i, :][pos]
 					edge_idxs[i, :] = edge_idxs[i, :][pos]
+					mask[i, :] = mask[i, :][pos]
 				else:
 					# Take most recent interactions
 					source_edge_times = src_edge_times[-n_neighbors:]
@@ -167,4 +173,9 @@ class NeighborFinder:
 					neighbors[i, n_neighbors - len(source_neighbors):] = source_neighbors
 					edge_times[i, n_neighbors - len(source_edge_times):] = source_edge_times
 					edge_idxs[i, n_neighbors - len(source_edge_idxs):] = source_edge_idxs
+					mask[i, n_neighbors - len(source_neighbors):] = 1.0
+		# The mask is opt-in so that callers written against the original three-value
+		# signature keep working unchanged.
+		if return_mask:
+			return neighbors, edge_idxs, edge_times, mask
 		return neighbors, edge_idxs, edge_times

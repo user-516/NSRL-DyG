@@ -1,5 +1,8 @@
+import os
 import torch
 import math
+import random
+import numpy as np
 from tqdm import tqdm
 import argparse
 from pathlib import Path
@@ -11,26 +14,40 @@ from utils.log_and_checkpoints import set_logger, get_checkpoint_path
 from utils.utils import get_parameter_sizes
 
 
-# n_degree 是用于聚合邻居信息时考虑的邻居数量，而 n_update_degree 是在强化学习决策过程中考虑的邻居数量(即要更新的邻居数量)
+# n_degree 是时间频率聚合(TFDGA)里考虑的邻居数量，也就是论文里的序列长度 L。
+# n_update_degree 是 MDP 候选集的规模：src 和 dst 各取这么多邻居，rollout 步数为 2*n_update_degree。
 ModelName = 'NSRLDyG'
 parser = argparse.ArgumentParser('NSRLDyG')
-parser.add_argument('-d', '--data', type=str, default='UCI-Msg')
-parser.add_argument('--bs', type=int, default=16, help='Batch_size')
-# n_degree默认200
-parser.add_argument('--n_degree', type=int, default=20, help='Number of neighbors to sample')
-# n_update_degree参数的大小要和类MultiHeadAttention中x_expanded = x.unsqueeze(1).expand(-1, 200, -1).to(self.device) 同时变化
-# n_update_degree默认20
-parser.add_argument('--n_update_degree', type=int, default=20, help='Number of neighbors to sample')
+parser.add_argument('-d', '--data', type=str, default='uci')
+parser.add_argument('--data_root', type=str,
+                    default=os.environ.get('NSRL_DATA_ROOT', 'E:/dataset/Ada-DyGNN-dataset'),
+                    help='Directory holding ml_<name>.csv, either flat or one subdir per dataset')
+parser.add_argument('--bs', type=int, default=64, help='Batch_size')
+parser.add_argument('--n_degree', type=int, default=20, help='TFDGA sequence length L')
+parser.add_argument('--n_update_degree', type=int, default=20, help='MDP candidates per endpoint')
 parser.add_argument('--n_epoch', type=int, default=30, help='Number of epochs')
 parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
+parser.add_argument('--lambda2', type=float, default=0.1, help='Entropy weight lambda_2 of Eq (19)')
+parser.add_argument('--rl_coef', type=float, default=0.05,
+                    help='Weight on the policy-gradient term; the advantage is batch-normalised, '
+                         'so the RL loss is O(1) per step and must be scaled down against the BCE term')
+parser.add_argument('--seed', type=int, default=2024, help='Random seed')
 log_to_file = True
 args = parser.parse_args()
+
+# A single seed for every source of randomness, so that the reported mean and standard
+# deviation can actually be reproduced.
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
 dataset = args.data
 Epoch = args.n_epoch
 Batchsize = args.bs
 n_neighbors = args.n_degree
 n_update_neighbors = args.n_update_degree
 lr = args.lr
+rl_coef = args.rl_coef
 logger, time_now = set_logger(ModelName, dataset, "", log_to_file)
 Path("log/{}/{}/checkpoints".format(ModelName, time_now)).mkdir(parents=True, exist_ok=True)
 Path("./Ap-result/").mkdir(parents=True, exist_ok=True)
@@ -39,7 +56,7 @@ f.write("bs = {}, degree = {}, up_degree = {}, lr = {}".format(Batchsize, n_neig
 f.write("\n")
 # data processing
 node_features, edge_features, full_data, train_data, \
-val_data, test_data, new_node_val_data, new_node_test_data, tot_time = get_data(dataset)
+val_data, test_data, new_node_val_data, new_node_test_data, tot_time = get_data(dataset, args.data_root)
 # initialize temporal graph
 train_neighbor_finder = get_neighbor_finder(train_data, False)
 full_neighbor_finder = get_neighbor_finder(full_data, False)
@@ -50,12 +67,16 @@ nn_val_rand_sampler = RandEdgeSampler(new_node_val_data.src, new_node_val_data.d
 test_rand_sampler = RandEdgeSampler(full_data.src, full_data.dst, seed=2)
 nn_test_rand_sampler = RandEdgeSampler(new_node_test_data.src, new_node_test_data.dst, seed=3)
 
-device = 'cuda'
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 model = NSRLDyG(node_features.shape[0], n_neighbors=n_neighbors, n_update_neighbors=n_update_neighbors,
 				 edge_dim=edge_features.shape[1], emb_dim=64, message_dim=64,neighbor_finder=train_neighbor_finder,
 				 edge_feat=edge_features, tot_time=tot_time, device=device)
+model.lambda2 = args.lambda2
 criterion = torch.nn.BCELoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+# Only trainable parameters.  memory.emb is a buffer that forward() updates in place;
+# the update carries a grad_fn, so after the first event that tensor becomes a non-leaf
+# and Adam would warn on every step.  It is updated by the model, never by the optimiser.
+optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=lr)
 LOSS = []
 Policy_LOSS = []
 acc, ap, auc = [], [], []
@@ -66,6 +87,7 @@ early_stopper = EarlyStopMonitor(max_round=100)
 logger.debug(f'model name: {ModelName}, #parameters: {get_parameter_sizes(model) * 4} B, '
 			 f'{get_parameter_sizes(model) * 4 / 1024} KB, {get_parameter_sizes(model) * 4 / 1024 / 1024} MB.')
 # =====================================
+print("epoch | trans  AUC    AP   | induc  AUC    AP", flush=True)
 for e in tqdm(range(Epoch)):
 	logger.debug('start {} epoch'.format(e))
 	num_batch = math.ceil(len(train_data.src) / Batchsize)
@@ -97,9 +119,11 @@ for e in tqdm(range(Epoch)):
 		loss += criterion(pos_prob, pos_label) + criterion(neg_prob, neg_label)
 		loss /= size
 		Loss += loss.item()
-		Policy_Loss += reinforce_loss
-		Reward += reward
-		loss += reinforce_loss
+		# .item() matters here: accumulating the tensor itself keeps its autograd graph alive
+		# across every batch of the epoch.
+		Policy_Loss += reinforce_loss.detach().item()
+		Reward += float(reward) if torch.is_tensor(reward) else reward
+		loss += rl_coef * reinforce_loss
 		loss.backward()
 		optimizer.step()
 		model.detach_memory()
@@ -130,6 +154,11 @@ for e in tqdm(range(Epoch)):
 	# ==================================================================================================
 	logger.debug("In validation, nacc = {}, nap = {}, nauc = {}".format(val_n_acc, val_n_ap, val_n_auc))
 	# ==================================================================================================
+	# The leading \r overwrites the tqdm progress bar, which writes on the same line
+	# with a carriage return and would otherwise swallow this message.
+	print("\repoch {:3d} | trans  AUC {:6.2f}  AP {:6.2f} | induc  AUC {:6.2f}  AP {:6.2f}"
+		  .format(e, val_auc * 100, val_ap * 100, val_n_auc * 100, val_n_ap * 100) + " " * 12,
+		  flush=True)
 	model.restore_memory(val_memory_backup)
 	path = get_checkpoint_path(ModelName, time_now, e)
 	check_path.append(path)
