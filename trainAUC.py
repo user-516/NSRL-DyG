@@ -92,7 +92,8 @@ Policy_LOSS = []
 acc, ap, auc = [], [], []
 nacc, nap, nauc = [], [], []
 check_path = []
-early_stopper = EarlyStopMonitor(max_round=100)
+early_stopper = EarlyStopMonitor(max_round=10)
+best_ap, best_epoch = -1.0, -1
 # =====================================
 logger.debug(f'model name: {ModelName}, #parameters: {get_parameter_sizes(model) * 4} B, '
 			 f'{get_parameter_sizes(model) * 4 / 1024} KB, {get_parameter_sizes(model) * 4 / 1024 / 1024} MB.')
@@ -172,6 +173,8 @@ for e in tqdm(range(Epoch)):
 	model.restore_memory(val_memory_backup)
 	path = get_checkpoint_path(ModelName, time_now, e)
 	check_path.append(path)
+	if val_ap > best_ap:
+		best_ap, best_epoch = val_ap, e
 	if early_stopper.early_stop_check(val_ap):
 		logger.info('No improvement over {} epochs, stop training'.format(early_stopper.max_round))
 		logger.info(f'Loading the best model at epoch {early_stopper.best_epoch}')
@@ -183,6 +186,12 @@ for e in tqdm(range(Epoch)):
 	else:
 		torch.save(model, path)
 
+# The validation curve oscillates, so the last epoch is not necessarily the best one.
+if best_epoch >= 0:
+	best_path = get_checkpoint_path(ModelName, time_now, best_epoch)
+	logger.info('Loading the best validation checkpoint from epoch {}'.format(best_epoch))
+	model = torch.load(best_path, map_location=device, weights_only=False)
+	model.to(device)
 memory_backup = model.back_up_memory()
 model.eval()
 model.set_neighbor_finder(full_neighbor_finder)
