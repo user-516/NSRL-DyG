@@ -27,9 +27,9 @@ STAGES = {
     ),
     # then the entropy weight and the candidate budget
     'stage2': dict(
-        epochs=3,
-        grid=dict(lr=[1e-3], rl_coef=[0.05],
-                  dim=[64, 128], n_degree=[20], n_update_degree=[5, 20], lambda2=[0.01, 0.1, 1.0]),
+        epochs=4,
+        grid=dict(lr=[1e-3], rl_coef=[0.5],
+                  dim=[64, 128], n_degree=[20], lambda2=[0.01, 0.1, 1.0]),
     ),
 }
 
