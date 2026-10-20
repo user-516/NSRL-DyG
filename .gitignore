@@ -15,3 +15,6 @@ data/
 
 # Machine-specific launcher (holds an absolute dataset path)
 run_local.ps1
+
+# Sweep output
+sweep_results.csv
