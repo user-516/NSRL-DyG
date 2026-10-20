@@ -181,6 +181,18 @@ class TFDDGANet(nn.Module):
 
         for m in (self.W_e, self.W_uc):
             nn.init.xavier_normal_(m.weight)
+
+        # ---- reinforced neighbour selection (Eq 12-20) ----------------------
+        # state = candidate contribution || centre memory || time || h_<i (both sides)
+        self.selection_mode = 'none'
+        self.beta = 0.1
+        state_dim = self.d_half + 2 * emb_dim + 2 * self.d_half
+        self.sel = nn.Sequential(
+            nn.Linear(state_dim, emb_dim), nn.ReLU(), nn.Linear(emb_dim, 1))
+        for m in (self.sel[0], self.sel[2]):
+            nn.init.xavier_normal_(m.weight)
+        self.register_buffer('sel_omega',
+                             1.0 / (10.0 ** (torch.arange(emb_dim).float() / emb_dim)))
         self.beta = 0.1
 
     # ------------------------------------------------------------------
@@ -210,6 +222,70 @@ class TFDDGANet(nn.Module):
         pooled = (fused * mask.unsqueeze(-1)).sum(1) / mask.sum(1, keepdim=True).clamp(min=1.0)
         return pooled, seq, alpha, mask, dt
 
+    def _score_msg(self, h_s, h_d, h_e, mem_s, mem_d):
+        """Eq (22) evaluated on a message built from the aggregates (h_s, h_d)."""
+        msg = torch.cat([h_s, h_d, h_e], dim=-1)
+        rs = torch.tanh(self.W_uc(torch.cat([mem_s, msg], dim=-1)))
+        rd = torch.tanh(self.W_uc(torch.cat([mem_d, msg], dim=-1)))
+        return torch.sigmoid((rs * rd).sum(-1))
+
+    def _rollout(self, seq_s, mk_s, dt_s, seq_d, mk_d, dt_d,
+                 mem_s, mem_d, h_e):
+        """Eq (13)-(20): walk the candidates in recency order, gating each one.
+
+        State   c_i || centre memory || cos(dt_i * omega) || h_<i
+        Action  1 if the candidate joins the aggregation
+        Trans.  h_<i+1 = h_<i + a_i c_i
+        Reward  marginal increase of the prediction score, which is the negative of
+                the marginal drop in the prediction loss.
+        """
+        K = self.n_update_neighbors
+        c = torch.cat([seq_s[:, -K:], seq_d[:, -K:]], dim=1)
+        v = torch.cat([mk_s[:, -K:], mk_d[:, -K:]], dim=1)
+        dt = torch.cat([dt_s[:, -K:], dt_d[:, -K:]], dim=1)
+        order = torch.argsort(dt, dim=1)                       # most recent first
+        gather = lambda x: torch.gather(x, 1, order.unsqueeze(-1).expand(-1, -1, x.size(-1)))
+        c = gather(c)
+        v = torch.gather(v, 1, order)
+        dt = torch.gather(dt, 1, order)
+        is_src = (order < K).float()
+        B, N, D = c.shape
+
+        h_s = torch.zeros(B, D, device=self.device)
+        h_d = torch.zeros(B, D, device=self.device)
+        cnt_s = torch.zeros(B, 1, device=self.device)
+        cnt_d = torch.zeros(B, 1, device=self.device)
+        states = [(h_s, h_d)]
+        log_pi, ent = [], []
+        for i in range(N):
+            cur_s = h_s / cnt_s.clamp(min=1.0)
+            cur_d = h_d / cnt_d.clamp(min=1.0)
+            h_ctx = torch.zeros_like(torch.cat([cur_s, cur_d], dim=-1)) \
+                if self.selection_mode == 'noh' else torch.cat([cur_s, cur_d], dim=-1)
+            t_i = torch.cos(dt[:, i].unsqueeze(-1) * self.sel_omega)
+            state = torch.cat([c[:, i], mem_s, t_i, h_ctx], dim=-1).detach()
+            p = torch.sigmoid(self.sel(state).squeeze(-1)).clamp(1e-6, 1 - 1e-6)
+            with torch.no_grad():
+                a = (torch.bernoulli(p.detach()) if self.training
+                     else (p.detach() >= 0.5).float()) * v[:, i]
+                w = (a * is_src[:, i]).unsqueeze(-1)
+                h_s = h_s + w * c[:, i]
+                cnt_s = cnt_s + w[:, :1]
+                w = (a * (1 - is_src[:, i])).unsqueeze(-1)
+                h_d = h_d + w * c[:, i]
+                cnt_d = cnt_d + w[:, :1]
+                states.append((h_s, h_d))
+            log_pi.append((torch.log(p) * a + torch.log(1 - p) * (1 - a)) * v[:, i])
+            ent.append(-(p * torch.log(p) + (1 - p) * torch.log(1 - p)) * v[:, i])
+
+        with torch.no_grad():
+            L = torch.stack([self._score_msg(hs / cnt_s.clamp(min=1.0),
+                                             hd / cnt_d.clamp(min=1.0), h_e, mem_s, mem_d)
+                             for hs, hd in states], 1)
+            returns = L[:, 1:] - L[:, :-1]          # positive when the score improves
+        return (h_s / cnt_s.clamp(min=1.0), h_d / cnt_d.clamp(min=1.0),
+                torch.stack(log_pi, 1), torch.stack(ent, 1), returns)
+
     # ------------------------------------------------------------------
     def forward(self, src_idxs, dst_idxs, neg_idxs, edge_idxs, timestamps):
         src_t = torch.as_tensor(src_idxs, dtype=torch.long, device=self.device)
@@ -226,6 +302,19 @@ class TFDDGANet(nn.Module):
         m_s, seq_s, alpha_s, mk_s, dt_s = self._aggregate(src_t, timestamps)
         m_d, seq_d, alpha_d, mk_d, dt_d = self._aggregate(dst_t, timestamps)
 
+        policy_loss = torch.zeros((), device=self.device)
+        reward = torch.zeros((), device=self.device)
+        if self.selection_mode != 'none':
+            m_s, m_d, log_pi, ent, returns = self._rollout(
+                seq_s, mk_s, dt_s, seq_d, mk_d, dt_d, mem_s_pre, mem_d_pre, h_e)
+            if self.training:
+                adv = returns
+                sd = adv.std()
+                adv = adv / sd.clamp(min=1e-6) if sd > 1e-6 else adv * 0.0
+                adv = adv.clamp(-3.0, 3.0)
+                policy_loss = (-(log_pi * adv).sum() - self.beta * ent.sum()) / B
+            reward = returns.mean().detach()
+
         msg = torch.cat([m_s, m_d, h_e], dim=-1)                              # Eq (12)
         rep_s = torch.tanh(self.W_uc(torch.cat([mem_s_pre, msg], dim=-1)))
         rep_d = torch.tanh(self.W_uc(torch.cat([mem_d_pre, msg], dim=-1)))
@@ -237,10 +326,7 @@ class TFDDGANet(nn.Module):
             self.memory.emb[src_t] = rep_s.detach()
             self.memory.emb[dst_t] = rep_d.detach()
 
-        # The selection gate is added in a later step; this path currently evaluates the
-        # encoder on its own so that its accuracy can be measured in isolation.
-        zero = torch.zeros((), device=self.device)
-        return pos, neg, zero, zero
+        return pos, neg, policy_loss, reward
 
     # ------------------------------------------------------------------
     def compute_score(self, src_idxs, dst_idxs, neg_idxs, timestamps=None):
