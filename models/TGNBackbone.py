@@ -49,6 +49,7 @@ class TGNBackbone(nn.Module):
         self.edge_feat = torch.tensor(edge_feat, dtype=torch.float32).to(device)
         self.memory = Memory(n_nodes, emb_dim, device)
         self.time_enc = TimeEncode(emb_dim)
+        self.drop = nn.Dropout(0.2)
 
         msg_in = 2 * emb_dim + edge_dim + emb_dim      # mem_i || mem_center || edge || time
         self.W_msg = nn.Linear(msg_in, message_dim)
@@ -81,7 +82,7 @@ class TGNBackbone(nn.Module):
         # TGN's default aggregator keeps the most recent message; the neighbour array
         # is time-ordered with padding at the front, so the last column is the newest.
         agg = msg[:, -1, :] * mk[:, -1:].clamp(max=1.0)
-        return agg
+        return self.drop(agg)
 
     def forward(self, src_idxs, dst_idxs, neg_idxs, edge_idxs, timestamps):
         src_t = torch.as_tensor(src_idxs, dtype=torch.long, device=self.device)
@@ -102,7 +103,7 @@ class TGNBackbone(nn.Module):
         t = self.time_enc(torch.zeros(eidx.size(0), device=self.device))
 
         def _score(a, b):
-            return torch.sigmoid(self.score(torch.cat([a, b, e, t], dim=-1)).squeeze(-1))
+            return torch.sigmoid(self.score(self.drop(torch.cat([a, b, e, t], dim=-1))).squeeze(-1))
 
         pos = _score(rep_s, rep_d)
         neg = _score(rep_s, self.gru(self._aggregate(neg_t, timestamps), mem_n_old))
