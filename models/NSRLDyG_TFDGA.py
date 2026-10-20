@@ -178,8 +178,14 @@ class TFDDGANet(nn.Module):
         self.W_e = nn.Linear(edge_dim, message_dim)
         self.msg_dim = self.d_half * 2 + message_dim
         self.W_uc = nn.Linear(emb_dim + self.msg_dim, emb_dim)
+        # A GRU update and a learned scorer, as in the TGN backbone: the tanh update and
+        # the dot-product score lose information that these two keep.
+        self.gru = nn.GRUCell(self.msg_dim, emb_dim)
+        self.score_mlp = nn.Sequential(
+            nn.Linear(2 * emb_dim + message_dim, emb_dim), nn.ReLU(),
+            nn.Linear(emb_dim, 1))
 
-        for m in (self.W_e, self.W_uc):
+        for m in (self.W_e, self.W_uc, self.score_mlp[0], self.score_mlp[2]):
             nn.init.xavier_normal_(m.weight)
 
         # ---- reinforced neighbour selection (Eq 12-20) ----------------------
@@ -222,15 +228,15 @@ class TFDDGANet(nn.Module):
         pooled = (fused * mask.unsqueeze(-1)).sum(1) / mask.sum(1, keepdim=True).clamp(min=1.0)
         return pooled, seq, alpha, mask, dt
 
-    def _score_msg(self, h_s, h_d, h_e, mem_s, mem_d):
-        """Eq (22) evaluated on a message built from the aggregates (h_s, h_d)."""
+    def _score_msg(self, h_s, h_d, h_e, mem_s, mem_d, e):
+        """Link-prediction score of a message built from (h_s, h_d)."""
         msg = torch.cat([h_s, h_d, h_e], dim=-1)
-        rs = torch.tanh(self.W_uc(torch.cat([mem_s, msg], dim=-1)))
-        rd = torch.tanh(self.W_uc(torch.cat([mem_d, msg], dim=-1)))
-        return torch.sigmoid((rs * rd).sum(-1))
+        rs = self.gru(msg, mem_s)
+        rd = self.gru(msg, mem_d)
+        return torch.sigmoid(self.score_mlp(torch.cat([rs, rd, e], dim=-1)).squeeze(-1))
 
     def _rollout(self, seq_s, mk_s, dt_s, seq_d, mk_d, dt_d,
-                 mem_s, mem_d, h_e):
+                 mem_s, mem_d, h_e, e):
         """Eq (13)-(20): walk the candidates in recency order, gating each one.
 
         State   c_i || centre memory || cos(dt_i * omega) || h_<i
@@ -287,7 +293,7 @@ class TFDDGANet(nn.Module):
 
         with torch.no_grad():
             L = torch.stack([self._score_msg(hs / cnt_s.clamp(min=1.0),
-                                             hd / cnt_d.clamp(min=1.0), h_e, mem_s, mem_d)
+                                             hd / cnt_d.clamp(min=1.0), h_e, mem_s, mem_d, e)
                              for hs, hd in states], 1)
             returns = L[:, 1:] - L[:, :-1]          # positive when the score improves
         a_all = torch.stack(acted, 1)
@@ -315,7 +321,7 @@ class TFDDGANet(nn.Module):
         reward = torch.zeros((), device=self.device)
         if self.selection_mode != 'none':
             agg_s, agg_d, log_pi, ent, returns, a_orig = self._rollout(
-                seq_s, mk_s, dt_s, seq_d, mk_d, dt_d, mem_s_pre, mem_d_pre, h_e)
+                seq_s, mk_s, dt_s, seq_d, mk_d, dt_d, mem_s_pre, mem_d_pre, h_e, h_e)
             K = self.n_neighbors
             # Apply the gate to the sequence and push it through the same partition and
             # fusion the ungated path uses; the gate must not bypass Eqs (7)-(11).
@@ -342,11 +348,11 @@ class TFDDGANet(nn.Module):
             reward = returns.mean().detach()
 
         msg = torch.cat([m_s, m_d, h_e], dim=-1)                              # Eq (12)
-        rep_s = torch.tanh(self.W_uc(torch.cat([mem_s_pre, msg], dim=-1)))
-        rep_d = torch.tanh(self.W_uc(torch.cat([mem_d_pre, msg], dim=-1)))
-        rep_n = torch.tanh(self.W_uc(torch.cat([mem_n_pre, msg], dim=-1)))
-        pos = torch.sigmoid((rep_s * rep_d).sum(-1))
-        neg = torch.sigmoid((rep_s * rep_n).sum(-1))
+        rep_s = self.gru(msg, mem_s_pre)
+        rep_d = self.gru(msg, mem_d_pre)
+        rep_n = self.gru(msg, mem_n_pre)
+        pos = torch.sigmoid(self.score_mlp(torch.cat([rep_s, rep_d, h_e], dim=-1)).squeeze(-1))
+        neg = torch.sigmoid(self.score_mlp(torch.cat([rep_s, rep_n, h_e], dim=-1)).squeeze(-1))
 
         with torch.no_grad():
             self.memory.emb[src_t] = rep_s.detach()
