@@ -36,7 +36,7 @@ parser.add_argument('--model', type=str, default='legacy',
                     choices=['legacy', 'tfdga', 'tgn'],
                     help='legacy = models/NSRLDyG.py; tfdga = the retrained TFDGA front end')
 parser.add_argument('--selection_mode', type=str, default='parallel',
-                    choices=['parallel', 'mdp', 'mdp_noh'],
+                    choices=['none', 'parallel', 'mdp', 'noh', 'mdp_noh'],
                     help="parallel = the original gate; mdp = sequential MDP with h_{<i}; "
                          "mdp_noh = same rollout with h_{<i} withheld from the state")
 parser.add_argument('--rl_coef', type=float, default=0.05,
@@ -83,7 +83,12 @@ model = ModelClass(node_features.shape[0], n_neighbors=n_neighbors, n_update_nei
 				 edge_dim=edge_features.shape[1], emb_dim=args.dim, message_dim=args.dim,neighbor_finder=train_neighbor_finder,
 				 edge_feat=edge_features, tot_time=tot_time, device=device)
 model.lambda2 = args.lambda2
-model.selection_mode = args.selection_mode
+mode = args.selection_mode
+if args.model == 'tgn':
+	mode = {'parallel': 'none', 'mdp_noh': 'noh'}.get(mode, mode)
+elif args.model == 'legacy':
+	mode = {'none': 'parallel', 'noh': 'mdp_noh'}.get(mode, mode)
+model.selection_mode = mode
 criterion = torch.nn.BCELoss()
 # Only trainable parameters.  memory.emb is a buffer that forward() updates in place;
 # the update carries a grad_fn, so after the first event that tensor becomes a non-leaf
