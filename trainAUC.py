@@ -30,6 +30,7 @@ parser.add_argument('--n_degree', type=int, default=20, help='TFDGA sequence len
 parser.add_argument('--n_update_degree', type=int, default=20, help='MDP candidates per endpoint')
 parser.add_argument('--n_epoch', type=int, default=30, help='Number of epochs')
 parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
+parser.add_argument('--dim', type=int, default=64, help='Embedding/message dimension')
 parser.add_argument('--lambda2', type=float, default=0.1, help='Entropy weight lambda_2 of Eq (19)')
 parser.add_argument('--model', type=str, default='legacy',
                     choices=['legacy', 'tfdga', 'tgn'],
@@ -79,7 +80,7 @@ nn_test_rand_sampler = RandEdgeSampler(new_node_test_data.src, new_node_test_dat
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 ModelClass = {'tfdga': TFDDGANet, 'tgn': TGNBackbone}.get(args.model, NSRLDyG)
 model = ModelClass(node_features.shape[0], n_neighbors=n_neighbors, n_update_neighbors=n_update_neighbors,
-				 edge_dim=edge_features.shape[1], emb_dim=64, message_dim=64,neighbor_finder=train_neighbor_finder,
+				 edge_dim=edge_features.shape[1], emb_dim=args.dim, message_dim=args.dim,neighbor_finder=train_neighbor_finder,
 				 edge_feat=edge_features, tot_time=tot_time, device=device)
 model.lambda2 = args.lambda2
 model.selection_mode = args.selection_mode
