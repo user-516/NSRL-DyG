@@ -186,7 +186,10 @@ class TGNBackbone(nn.Module):
                 sd = adv.std()
                 adv = adv / sd.clamp(min=1e-6) if sd > 1e-6 else adv * 0.0
                 adv = adv.clamp(-3.0, 3.0)
-                policy_loss = (-(log_pi * adv).sum() - self.beta * ent.sum()) / B
+                # Normalise by the number of decisions, not just the batch: the loss sums
+                # over B * 2K decisions, and dividing by B alone makes the policy term
+                # two orders of magnitude larger than the supervised loss.
+                policy_loss = (-(log_pi * adv).sum() - self.beta * ent.sum()) / (B * log_pi.size(1))
             reward = returns.mean().detach()
         agg_n = self._aggregate_none(neg_t, timestamps)
 

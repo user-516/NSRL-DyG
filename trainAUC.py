@@ -83,6 +83,8 @@ model = ModelClass(node_features.shape[0], n_neighbors=n_neighbors, n_update_nei
 				 edge_dim=edge_features.shape[1], emb_dim=args.dim, message_dim=args.dim,neighbor_finder=train_neighbor_finder,
 				 edge_feat=edge_features, tot_time=tot_time, device=device)
 model.lambda2 = args.lambda2
+if hasattr(model, 'beta'):
+	model.beta = args.lambda2
 mode = args.selection_mode
 if args.model == 'tgn':
 	mode = {'parallel': 'none', 'mdp_noh': 'noh'}.get(mode, mode)

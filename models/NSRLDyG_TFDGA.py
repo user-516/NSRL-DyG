@@ -239,7 +239,10 @@ class TFDDGANet(nn.Module):
         Reward  marginal increase of the prediction score, which is the negative of
                 the marginal drop in the prediction loss.
         """
-        K = self.n_update_neighbors
+        # The candidate set is the aggregation set: every neighbour of the two
+        # endpoints is a candidate, as in Eq (3).  Using a smaller candidate set
+        # would discard part of the neighbourhood that the ungated path keeps.
+        K = self.n_neighbors
         c = torch.cat([seq_s[:, -K:], seq_d[:, -K:]], dim=1)
         v = torch.cat([mk_s[:, -K:], mk_d[:, -K:]], dim=1)
         dt = torch.cat([dt_s[:, -K:], dt_d[:, -K:]], dim=1)
@@ -249,6 +252,9 @@ class TFDDGANet(nn.Module):
         v = torch.gather(v, 1, order)
         dt = torch.gather(dt, 1, order)
         is_src = (order < K).float()
+        center = torch.where(is_src.unsqueeze(-1) > 0,
+                             mem_s.unsqueeze(1).expand(-1, 2 * K, -1),
+                             mem_d.unsqueeze(1).expand(-1, 2 * K, -1))
         B, N, D = c.shape
 
         h_s = torch.zeros(B, D, device=self.device)
@@ -256,14 +262,14 @@ class TFDDGANet(nn.Module):
         cnt_s = torch.zeros(B, 1, device=self.device)
         cnt_d = torch.zeros(B, 1, device=self.device)
         states = [(h_s, h_d)]
-        log_pi, ent = [], []
+        log_pi, ent, acted = [], [], []
         for i in range(N):
             cur_s = h_s / cnt_s.clamp(min=1.0)
             cur_d = h_d / cnt_d.clamp(min=1.0)
             h_ctx = torch.zeros_like(torch.cat([cur_s, cur_d], dim=-1)) \
                 if self.selection_mode == 'noh' else torch.cat([cur_s, cur_d], dim=-1)
             t_i = torch.cos(dt[:, i].unsqueeze(-1) * self.sel_omega)
-            state = torch.cat([c[:, i], mem_s, t_i, h_ctx], dim=-1).detach()
+            state = torch.cat([c[:, i], center[:, i], t_i, h_ctx], dim=-1).detach()
             p = torch.sigmoid(self.sel(state).squeeze(-1)).clamp(1e-6, 1 - 1e-6)
             with torch.no_grad():
                 a = (torch.bernoulli(p.detach()) if self.training
@@ -275,6 +281,7 @@ class TFDDGANet(nn.Module):
                 h_d = h_d + w * c[:, i]
                 cnt_d = cnt_d + w[:, :1]
                 states.append((h_s, h_d))
+            acted.append(a)
             log_pi.append((torch.log(p) * a + torch.log(1 - p) * (1 - a)) * v[:, i])
             ent.append(-(p * torch.log(p) + (1 - p) * torch.log(1 - p)) * v[:, i])
 
@@ -283,8 +290,10 @@ class TFDDGANet(nn.Module):
                                              hd / cnt_d.clamp(min=1.0), h_e, mem_s, mem_d)
                              for hs, hd in states], 1)
             returns = L[:, 1:] - L[:, :-1]          # positive when the score improves
+        a_all = torch.stack(acted, 1)
+        a_orig = torch.zeros_like(v).scatter(1, order, a_all)
         return (h_s / cnt_s.clamp(min=1.0), h_d / cnt_d.clamp(min=1.0),
-                torch.stack(log_pi, 1), torch.stack(ent, 1), returns)
+                torch.stack(log_pi, 1), torch.stack(ent, 1), returns, a_orig)
 
     # ------------------------------------------------------------------
     def forward(self, src_idxs, dst_idxs, neg_idxs, edge_idxs, timestamps):
@@ -305,14 +314,31 @@ class TFDDGANet(nn.Module):
         policy_loss = torch.zeros((), device=self.device)
         reward = torch.zeros((), device=self.device)
         if self.selection_mode != 'none':
-            m_s, m_d, log_pi, ent, returns = self._rollout(
+            agg_s, agg_d, log_pi, ent, returns, a_orig = self._rollout(
                 seq_s, mk_s, dt_s, seq_d, mk_d, dt_d, mem_s_pre, mem_d_pre, h_e)
+            K = self.n_neighbors
+            # Apply the gate to the sequence and push it through the same partition and
+            # fusion the ungated path uses; the gate must not bypass Eqs (7)-(11).
+            m_sel = []
+            for seq, mk, dt, a in ((seq_s, mk_s, dt_s, a_orig[:, :K]),
+                                   (seq_d, mk_d, dt_d, a_orig[:, K:])):
+                keep = torch.ones(seq.size(0), seq.size(1), device=self.device)
+                keep[:, -K:] = a
+                seq_g = seq * keep.unsqueeze(-1)
+                M_l, M_g = self.partition(seq_g, dt, mk)
+                fused = self.fusion(seq_g, M_l, M_g, mk)
+                m_sel.append((fused * mk.unsqueeze(-1)).sum(1)
+                             / mk.sum(1, keepdim=True).clamp(min=1.0))
+            m_s, m_d = m_sel
             if self.training:
                 adv = returns
                 sd = adv.std()
                 adv = adv / sd.clamp(min=1e-6) if sd > 1e-6 else adv * 0.0
                 adv = adv.clamp(-3.0, 3.0)
-                policy_loss = (-(log_pi * adv).sum() - self.beta * ent.sum()) / B
+                # Normalise by the number of decisions, not just the batch: the loss sums
+                # over B * 2K decisions, and dividing by B alone makes the policy term
+                # two orders of magnitude larger than the supervised loss.
+                policy_loss = (-(log_pi * adv).sum() - self.beta * ent.sum()) / (B * log_pi.size(1))
             reward = returns.mean().detach()
 
         msg = torch.cat([m_s, m_d, h_e], dim=-1)                              # Eq (12)
