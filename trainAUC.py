@@ -8,6 +8,7 @@ import argparse
 from pathlib import Path
 from models.NSRLDyG import NSRLDyG
 from models.NSRLDyG_TFDGA import TFDDGANet
+from models.TGNBackbone import TGNBackbone
 from utils.data_processing import get_data
 from utils.utils import get_neighbor_finder, RandEdgeSampler, EarlyStopMonitor
 from utils.evaluationAUC import eval_edge_prediction_auc
@@ -31,7 +32,7 @@ parser.add_argument('--n_epoch', type=int, default=30, help='Number of epochs')
 parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
 parser.add_argument('--lambda2', type=float, default=0.1, help='Entropy weight lambda_2 of Eq (19)')
 parser.add_argument('--model', type=str, default='legacy',
-                    choices=['legacy', 'tfdga'],
+                    choices=['legacy', 'tfdga', 'tgn'],
                     help='legacy = models/NSRLDyG.py; tfdga = the retrained TFDGA front end')
 parser.add_argument('--selection_mode', type=str, default='parallel',
                     choices=['parallel', 'mdp', 'mdp_noh'],
@@ -76,7 +77,7 @@ test_rand_sampler = RandEdgeSampler(full_data.src, full_data.dst, seed=2)
 nn_test_rand_sampler = RandEdgeSampler(new_node_test_data.src, new_node_test_data.dst, seed=3)
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-ModelClass = TFDDGANet if args.model == 'tfdga' else NSRLDyG
+ModelClass = {'tfdga': TFDDGANet, 'tgn': TGNBackbone}.get(args.model, NSRLDyG)
 model = ModelClass(node_features.shape[0], n_neighbors=n_neighbors, n_update_neighbors=n_update_neighbors,
 				 edge_dim=edge_features.shape[1], emb_dim=64, message_dim=64,neighbor_finder=train_neighbor_finder,
 				 edge_feat=edge_features, tot_time=tot_time, device=device)
